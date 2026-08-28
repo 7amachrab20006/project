@@ -1,0 +1,85 @@
+<div class="app-layout">
+  <!-- Background Glow & Grid effects -->
+  <div class="bg-glow bg-glow-1"></div>
+  <div class="bg-glow bg-glow-2"></div>
+  <div class="grid-overlay"></div>
+
+  <!-- Header -->
+  <app-header (toggleHistory)="toggleHistory()"></app-header>
+
+  <!-- Main Content Area -->
+  <main class="main-container">
+    <!-- Search Console & Presets -->
+    <app-search-console (search)="onSearch($event)"></app-search-console>
+
+    <!-- Multi-Agent Stepper Visualizer -->
+    <app-agent-pipeline></app-agent-pipeline>
+
+    <!-- Error Banner -->
+    <div class="error-banner" *ngIf="advisorService.errorMessage()">
+      <div class="error-icon">
+        <app-icon name="alert" [size]="20"></app-icon>
+      </div>
+      <div class="error-content">
+        <h4>Agent Pipeline Execution Error</h4>
+        <p>{{ advisorService.errorMessage() }}</p>
+      </div>
+      <button type="button" class="btn-dismiss" (click)="advisorService.clearActiveResults()">
+        <app-icon name="x" [size]="16"></app-icon>
+      </button>
+    </div>
+
+    <!-- Recommendations Result Section -->
+    <section id="recommendation-results" *ngIf="advisorService.recommendation() as result">
+      <!-- Section Title & Query Info -->
+      <div class="results-header">
+        <div class="results-badge">
+          <app-icon name="award" [size]="16"></app-icon>
+          <span>Top AI Recommendations Found</span>
+        </div>
+        <h2 class="results-title">
+          Showing Best Matches for: <span class="query-highlight">"{{ result.user_request }}"</span>
+        </h2>
+      </div>
+
+      <!-- Executive AI Summary Card -->
+      <app-summary-card [recommendation]="result"></app-summary-card>
+
+      <!-- 3 Products Grid -->
+      <div class="products-grid" *ngIf="result.recommended_products && result.recommended_products.length > 0">
+        <app-product-card 
+          *ngFor="let prod of result.recommended_products; let i = index"
+          [product]="prod"
+          [rank]="i + 1">
+        </app-product-card>
+      </div>
+
+      <!-- Specs Comparison Matrix Table -->
+      <app-comparison-table 
+        *ngIf="result.recommended_products && result.recommended_products.length > 0"
+        [products]="result.recommended_products">
+      </app-comparison-table>
+    </section>
+  </main>
+
+  <!-- History Drawer -->
+  <app-history-drawer 
+    [isOpen]="isHistoryOpen" 
+    (close)="isHistoryOpen = false">
+  </app-history-drawer>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <div class="footer-container">
+      <div class="footer-left">
+        <span class="footer-brand">Multi-Agent Product Advisor</span>
+        <span class="footer-tech">FastAPI &bull; CrewAI &bull; Tavily Search &bull; MongoDB &bull; Angular 19</span>
+      </div>
+      <div class="footer-right">
+        <span class="footer-status-pill">
+          Deterministic Scoring Engine Active
+        </span>
+      </div>
+    </div>
+  </footer>
+</div>
