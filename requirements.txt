@@ -3,6 +3,6 @@ uvicorn[standard]
 crewai
 crewai-tools
 tavily-python
-pymongo
+pymongo[srv]
 python-dotenv
 pydantic
