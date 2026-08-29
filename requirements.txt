@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
-crewai
-crewai-tools
+crewai==0.11.2
+crewai-tools==0.0.1
 tavily-python
 pymongo[srv]
 python-dotenv
