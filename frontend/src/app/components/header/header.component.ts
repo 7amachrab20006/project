@@ -36,7 +36,7 @@ import { IconComponent } from '../icons/icon.component';
             title="Click to re-check API connectivity">
             <span class="status-dot"></span>
             <span class="status-text">
-              {{ advisorService.healthState().status === 'online' ? 'API Active (Port 8000)' : 
+              {{ advisorService.healthState().status === 'online' ? 'API Active' : 
                  advisorService.healthState().status === 'offline' ? 'Backend Offline' : 'Checking...' }}
             </span>
             <app-icon name="refresh" [size]="14" class="refresh-icon" [class.spinning]="advisorService.healthState().status === 'checking'"></app-icon>

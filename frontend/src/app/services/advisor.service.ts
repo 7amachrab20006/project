@@ -13,7 +13,7 @@ import {
   providedIn: 'root'
 })
 export class AdvisorService {
-  private readonly apiUrl = 'http://127.0.0.1:8000';
+  private apiUrl = 'https://project-glib.onrender.com';
 
   // State Signals
   readonly healthState = signal<SystemHealth>({ status: 'checking', message: 'Connecting to API...' });
