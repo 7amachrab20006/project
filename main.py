@@ -33,9 +33,9 @@ from pymongo import MongoClient
 from tavily import TavilyClient
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from crewai import Agent, Task, Crew, Process, LLM
-from crewai.tools import tool
-
+from crewai import Agent, Task, Crew, Process
+from langchain_groq import ChatGroq
+from crewai.tools import tool   
 
 
 # ==========================================
@@ -109,13 +109,9 @@ def get_previous_searches(limit=10):
 # CrewAI knows which provider to use from the "groq/" prefix in the model
 # name. You can swap the model for any model available on Groq
 # (e.g. "groq/llama-3.1-8b-instant" for a faster/cheaper option).
-basic_llm = LLM(
-    model="groq/openai/gpt-oss-20b",
-    api_key=GROQ_API_KEY,
-    temperature=0.3,
-    max_retries=8,
-    request_timeout=120,
-)
+os.environ["OPENAI_API_KEY"] = GROQ_API_KEY
+os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
+os.environ["OPENAI_MODEL_NAME"] = "openai/gpt-oss-20b"
 
 
 # ==========================================
@@ -270,7 +266,6 @@ researcher_agent = Agent(
         "present."
     ),
     tools=[search_products_tool],
-    llm=basic_llm,
     verbose=True,
 )
 
@@ -300,7 +295,6 @@ analyzer_agent = Agent(
         "value-add is making sure the tool gets clean, correctly-shaped input."
     ),
     tools=[score_products_tool],
-    llm=basic_llm,
     verbose=True,
 )
 
@@ -340,7 +334,6 @@ recommender_agent = Agent(
         "gaps in the data, and you never dress up incomplete information as "
         "certainty."
     ),
-    llm=basic_llm,
     verbose=True,
 )
 
