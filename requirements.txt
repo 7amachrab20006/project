@@ -1,10 +1,9 @@
 fastapi
 uvicorn[standard]
-crewai==0.11.2
-crewai-tools==0.0.1
-langchain==0.1.20
-langchain-groq==0.0.1
+crewai
+crewai-tools
 tavily-python
 pymongo[srv]
 python-dotenv
-pydantic<3.0.0
+pydantic
+litellm
