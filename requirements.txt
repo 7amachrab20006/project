@@ -6,3 +6,4 @@ tavily-python
 pymongo[srv]
 python-dotenv
 pydantic
+litellm
