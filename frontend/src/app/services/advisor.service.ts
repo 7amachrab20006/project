@@ -13,7 +13,9 @@ import {
   providedIn: 'root'
 })
 export class AdvisorService {
-  private apiUrl = 'https://project-glib.onrender.com';
+  private apiUrl = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+    ? 'http://127.0.0.1:8000'
+    : 'https://project-glib.onrender.com';
 
   // State Signals
   readonly healthState = signal<SystemHealth>({ status: 'checking', message: 'Connecting to API...' });

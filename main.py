@@ -1,58 +1,91 @@
 """
 MULTI-AGENT PRODUCT ADVISOR (CrewAI + FastAPI, Tavily search, JSON output via Pydantic)
 ==========================================================================================
-A beginner-friendly, single-file Multi-Agent AI application built with CrewAI.
-Products are found on the real web using the Tavily search API. All 3 agents
-run inside ONE Crew. The final answer is validated with Pydantic, saved as a
-.json file, and logged in MongoDB. A small FastAPI layer exposes the same
-workflow over HTTP.
-
+A Multi-Agent AI application built with CrewAI and Groq.
+Products are found on the web using the Tavily search API.
 Workflow:
     User Request -> Researcher Agent (searches the web via Tavily) ->
-    Analyzer Agent -> Recommender Agent -> final_recommendation.json
+    Analyzer Agent (deterministic mathematical scoring) ->
+    Recommender Agent -> final_recommendation.json
 
-Run it in terminal mode:
+Run terminal mode:
     python main.py
 
-Run it as a web API:
-    uvicorn main:app --reload
-    (then open http://127.0.0.1:8000/docs)
+Run API:
+    uvicorn main:app --reload --host 127.0.0.1 --port 8000
 """
 
-# ==========================================
-# 1. IMPORTS
-# ==========================================
 import os
+import sys
 import json
-import logging
-from typing import List
 import time
+import re
+import logging
+from typing import List, Optional, Any
+
+# Configure UTF-8 for Windows consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+import litellm
+
+# Configure LiteLLM patch for Groq compatibility (strip unsupported cache_breakpoint and handle TPM rate limits)
+orig_completion = litellm.completion
+
+def robust_groq_completion(*args, **kwargs):
+    if "messages" in kwargs and isinstance(kwargs["messages"], list):
+        cleaned_messages = []
+        for m in kwargs["messages"]:
+            if isinstance(m, dict):
+                cleaned_messages.append({k: v for k, v in m.items() if k != "cache_breakpoint"})
+            else:
+                cleaned_messages.append(m)
+        kwargs["messages"] = cleaned_messages
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            return orig_completion(*args, **kwargs)
+        except Exception as e:
+            err_str = str(e)
+            if "rate_limit" in err_str.lower() or "429" in err_str or "tpm" in err_str.lower():
+                wait_time = 8.0
+                match = re.search(r"try again in ([0-9.]+)s", err_str)
+                if match:
+                    wait_time = float(match.group(1)) + 1.0
+                logging.warning(f"[RateLimit] Hit Groq TPM limit. Sleeping {wait_time:.1f}s before retry ({attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                raise
+
+    return orig_completion(*args, **kwargs)
+
+litellm.completion = robust_groq_completion
+
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pymongo import MongoClient
 from tavily import TavilyClient
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from crewai import Agent, Task, Crew, Process
-from crewai_tools import tool
+from crewai import Agent, Task, Crew, Process, LLM
+from crewai.tools import BaseTool
 
 
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
 
-# Load variables from the .env file into the environment.
-# We NEVER hard-code secrets (API keys, database URIs) directly in the
-# code because:
-#   1. If you push your code to GitHub, they would be leaked publicly.
-#   2. Different people/environments (your laptop, a server, a teammate)
-#      can use different values without changing the code.
-#   3. It's a security best practice used in every real-world project.
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "groq/qwen/qwen3.8-27b")
 
 if not GROQ_API_KEY:
     raise ValueError(
@@ -64,73 +97,96 @@ if not TAVILY_API_KEY:
         "TAVILY_API_KEY is missing. Create a .env file and add: TAVILY_API_KEY=your_key_here"
     )
 
-# Where output files are written: one .md per task step (for debugging)
-# and the final answer as .json (the real deliverable).
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Simple logging so we can see what's happening, step by step.
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 3. DATABASE (MongoDB) — search history only
+# 3. DATABASE (MongoDB)
 # ==========================================
-#
-# We no longer store the product catalog in MongoDB, because products now
-# come live from the web via Tavily. MongoDB is still useful to keep a
-# history of what users searched for and what was recommended.
 
-client = MongoClient(MONGODB_URI)
-db = client["product_advisor"]
-searches_col = db["searches"]
+client = None
+searches_col = None
+
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    db = client["product_advisor"]
+    searches_col = db["searches"]
+    logger.info("MongoDB client initialized")
+except Exception as e:
+    logger.warning(f"MongoDB connection initialization note: {e}")
 
 
 def save_search(user_request, final_answer_dict):
     """Saves a record of what the user asked and what the crew recommended."""
-    searches_col.insert_one({
-        "user_request": user_request,
-        "recommendation": final_answer_dict,
-    })
+    if searches_col is not None:
+        try:
+            searches_col.insert_one({
+                "user_request": user_request,
+                "recommendation": final_answer_dict,
+                "timestamp": time.time()
+            })
+            logger.info("Search logged in MongoDB")
+        except Exception as e:
+            logger.warning(f"Could not save search to MongoDB: {e}")
 
 
 def get_previous_searches(limit=10):
     """Returns the most recent searches, newest first."""
-    return list(searches_col.find({}, {"_id": 0}).sort("_id", -1).limit(limit))
+    if searches_col is not None:
+        try:
+            return list(searches_col.find({}, {"_id": 0}).sort("_id", -1).limit(limit))
+        except Exception as e:
+            logger.warning(f"Could not fetch searches from MongoDB: {e}")
+            return []
+    return []
 
 
 # ==========================================
-# 4. LLM CONFIGURATION
+# 4. PYDANTIC OUTPUT SCHEMAS
 # ==========================================
-
-# One shared LLM object, passed to every CrewAI Agent via llm=basic_llm.
-# CrewAI knows which provider to use from the "groq/" prefix in the model
-# name. You can swap the model for any model available on Groq
-# (e.g. "groq/llama-3.1-8b-instant" for a faster/cheaper option).
-os.environ["OPENAI_API_KEY"] = GROQ_API_KEY
-os.environ["OPENAI_API_BASE"] = "https://api.groq.com/openai/v1"
-os.environ["OPENAI_MODEL_NAME"] = "openai/gpt-oss-20b"
-
-
-# ==========================================
-# 5. PYDANTIC OUTPUT SCHEMA
-# ==========================================
-#
-# Pydantic lets us describe EXACTLY what shape the final answer must have,
-# and it automatically validates the LLM's output against that shape.
-# If the LLM's JSON is missing a field or has the wrong type, Pydantic
-# raises a clear error instead of letting bad data silently pass through.
 
 class RecommendedProduct(BaseModel):
-    name: str = Field(description="Product name")
-    price: float = Field(description="Price of the product, in the currency mentioned by the user (0 if unknown)")
-    cpu: str = Field(description="CPU / processor, or 'unknown' if not found")
-    ram: int = Field(description="RAM in GB (0 if unknown)")
-    battery_hours: int = Field(description="Battery life in hours (0 if unknown)")
-    score: int = Field(description="Score calculated by the Score Products tool")
-    reason: str = Field(description="Short explanation of why this product is recommended")
-    source_url: str = Field(description="The web page this product info came from")
+    name: str = Field(default="Unknown Product", description="Product name")
+    price: float = Field(default=0.0, description="Price of the product, in user currency (0 if unknown)")
+    cpu: str = Field(default="unknown", description="CPU / processor, or 'unknown' if not found")
+    ram: int = Field(default=0, description="RAM in GB (0 if unknown)")
+    battery_hours: int = Field(default=0, description="Battery life in hours (0 if unknown)")
+    score: int = Field(default=0, description="Score calculated by the Score Products tool")
+    reason: str = Field(default="", description="Short explanation of why this product is recommended")
+    source_url: str = Field(default="", description="The web page this product info came from")
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def parse_price(cls, v: Any) -> float:
+        if v is None:
+            return 0.0
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0.0
+
+    @field_validator("ram", "battery_hours", "score", mode="before")
+    @classmethod
+    def parse_ints(cls, v: Any) -> int:
+        if v is None:
+            return 0
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
+
+    @field_validator("cpu", "reason", "source_url", mode="before")
+    @classmethod
+    def parse_strings(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)
 
 
 class FinalRecommendation(BaseModel):
@@ -142,335 +198,295 @@ class FinalRecommendation(BaseModel):
 
 
 # ==========================================
-# 6. TOOLS
+# 5. TOOLS
 # ==========================================
-#
-# Tools are normal Python functions that an Agent can call to get
-# information or to run an exact calculation.
-#
-#   Agent -> Tool -> Tavily web search / Python logic -> Result -> Agent
-#
-# search_products_tool now searches the REAL web via Tavily instead of a
-# fixed catalog. Tavily returns page titles, URLs, and text snippets — it
-# does NOT return a guaranteed structured schema (no fixed "price" or
-# "ram" field). That means the Researcher Agent (LLM) has to read the
-# snippets and extract whatever specs it can find, which is less exact
-# than a real database. score_products_tool still does the MATH in plain
-# Python on whatever numbers the researcher extracted — Python never
-# invents a score, but the underlying numbers now depend on what Tavily
-# found on the web and how well the LLM read them.
 
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 
-@tool("Search Products")
-def search_products_tool(query: str) -> str:
-    """
-    Searches the real web (via Tavily) for products matching the query,
-    e.g. "best laptop for programming under 2500 DT". Returns a JSON
-    string with a list of results, each containing 'title', 'url', and
-    'content' (a text snippet about the product/page).
-    """
-    response = tavily_client.search(
-        query=query,
-        search_depth="basic",
-        max_results=2,          # كان 6 ثم 4
+class SearchProductsTool(BaseTool):
+    name: str = "Search Products"
+    description: str = (
+        "Searches the real web (via Tavily) for products matching the query. "
+        "Returns a JSON string with a list of results containing title, url, and content snippet."
     )
-    results = [
-        {
-            "title": item.get("title", "")[:80],
-            "url": item.get("url", ""),
-            "content": item.get("content", "")[:150],  # قصّرها أكثر
-        }
-        for item in response.get("results", [])
-    ]
-    return json.dumps(results)
+
+    def _run(self, query: str) -> str:
+        logger.info(f"Running web search with query: {query}")
+        try:
+            response = tavily_client.search(
+                query=query,
+                search_depth="basic",
+                max_results=4,
+            )
+            results = [
+                {
+                    "title": item.get("title", "")[:120],
+                    "url": item.get("url", ""),
+                    "content": item.get("content", "")[:250],
+                }
+                for item in response.get("results", [])
+            ]
+            return json.dumps(results, indent=2)
+        except Exception as e:
+            logger.error(f"Error during search: {e}")
+            return json.dumps([{"title": "Search Error", "url": "", "content": str(e)}])
 
 
-def calculate_score(product, requirements):
-    """Plain Python, deterministic scoring rule."""
+search_products_tool = SearchProductsTool()
+
+
+def calculate_score(product: dict, requirements: dict) -> int:
+    """Deterministic mathematical scoring rule."""
     score = 0
-    budget = requirements.get("budget", 999999)
+    try:
+        budget = float(requirements.get("budget", 999999) or 999999)
+    except (ValueError, TypeError):
+        budget = 999999.0
 
-    if product.get("price", 0) and product["price"] <= budget:
+    try:
+        price = float(product.get("price", 0) or 0)
+    except (ValueError, TypeError):
+        price = 0.0
+
+    if price > 0 and price <= budget:
         score += 30
 
-    if product.get("ram", 0) >= 16:
+    try:
+        ram = int(product.get("ram", 0) or 0)
+    except (ValueError, TypeError):
+        ram = 0
+
+    if ram >= 16:
         score += 20
 
-    if product.get("battery_hours", 0) >= 8:
+    try:
+        battery = int(product.get("battery_hours", 0) or 0)
+    except (ValueError, TypeError):
+        battery = 0
+
+    if battery >= 8:
         score += 20
 
-    if requirements.get("use_case", "").lower() in product.get("use_case", "").lower():
+    use_case = str(requirements.get("use_case", "") or "").lower()
+    prod_use_case = str(product.get("use_case", "") or "").lower()
+    if use_case and use_case in prod_use_case:
         score += 30
 
     return score
 
 
-@tool("Score Products")
-def score_products_tool(products_and_requirements_json: str) -> str:
-    """
-    Takes a JSON string shaped like:
-    {"requirements": {"use_case": "...", "budget": number},
-     "products": [{"name":..., "price":..., "ram":..., "battery_hours":..., "use_case":..., "source_url":...}, ...]}
-    and returns a JSON array of the same products, each with an added
-    "score" field, sorted from best to worst. The score is calculated by
-    plain Python (calculate_score), never invented by the LLM.
-    """
-    data = json.loads(products_and_requirements_json)
-    requirements = data.get("requirements", {})
-    products = data.get("products", [])
+class ScoreProductsTool(BaseTool):
+    name: str = "Score Products"
+    description: str = (
+        "Takes a JSON string with requirements and candidate products, "
+        "scores them deterministically with Python, and returns the sorted JSON array."
+    )
 
-    scored = [{**p, "score": calculate_score(p, requirements)} for p in products]
-    scored.sort(key=lambda item: item["score"], reverse=True)
+    def _run(self, products_and_requirements_json: str) -> str:
+        logger.info("Executing scoring tool...")
+        raw = products_and_requirements_json
+        if isinstance(raw, str):
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+                if m:
+                    cleaned = m.group(1).strip()
+            s = cleaned.find("{")
+            e = cleaned.rfind("}")
+            if s != -1 and e != -1:
+                cleaned = cleaned[s:e+1]
+            try:
+                data = json.loads(cleaned)
+            except Exception:
+                data = {"requirements": {}, "products": []}
+        else:
+            data = raw if isinstance(raw, dict) else {"requirements": {}, "products": []}
 
-    return json.dumps(scored)
+        requirements = data.get("requirements", {})
+        products = data.get("products", [])
+        scored = [{**p, "score": calculate_score(p, requirements)} for p in products]
+        scored.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return json.dumps(scored, indent=2)
 
-def wait_for_tpm_reset(task_output):
-    logger.info("Waiting 25s to let TPM quota refill...")
-    time.sleep(25)
+
+score_products_tool = ScoreProductsTool()
+
+
+def task_pause_callback(task_output):
+    """Brief pause between tasks to help prevent hitting API rate limits."""
+    time.sleep(2)
+
+
 # ==========================================
-# 7. AGENT 1 — RESEARCHER
+# 6. AGENTS & WORKFLOW
 # ==========================================
+
+llm = LLM(model=GROQ_MODEL, api_key=GROQ_API_KEY)
 
 researcher_agent = Agent(
     role="Senior Product Research Specialist",
     goal=(
-        "Given a user request, do the following in order:\n"
-        "1) Extract the use_case (e.g. 'programming', 'gaming', 'office work', "
-        "'video editing') and the budget (as a number, in the currency the user "
-        "mentioned). If the budget or use_case is ambiguous, make the most "
-        "reasonable assumption and note it — never leave them blank.\n"
-        "2) Build ONE precise, high-signal search query (include use case, "
-        "budget, and year if relevant) and call the Search Products tool with it. "
-        "If the first results are thin or irrelevant, refine the query once and "
-        "search again rather than giving up.\n"
-        "3) From the titles/snippets returned, extract as many DISTINCT real "
-        "products as possible (never merge two different products into one "
-        "entry, never invent a product that isn't backed by a search result).\n"
-        "4) For every field you cannot find explicit evidence for in the search "
-        "results, use the documented default (price=0, cpu='unknown', ram=0, "
-        "battery_hours=0) — never guess or estimate a number that wasn't stated "
-        "on the page.\n"
-        "5) Output ONLY the raw JSON object described in expected_output — no "
-        "markdown fences, no commentary, no trailing text."
+        "Call Search Products tool ONCE with a well-targeted query. "
+        "Extract products from the search snippets and return the final JSON object immediately."
     ),
     backstory=(
-        "You are a meticulous hardware researcher with 10 years of experience "
-        "comparing consumer electronics. You have zero tolerance for making up "
-        "specs — you would rather mark a field 'unknown' than guess, because a "
-        "wrong spec is worse than a missing one. You are also skilled at reading "
-        "between the lines of messy e-commerce or review snippets to reliably "
-        "pull out concrete numbers (price, RAM, battery life) when they ARE "
-        "present."
+        "You are an expert product researcher skilled at finding real laptop specifications "
+        "from e-commerce web search snippets accurately."
     ),
     tools=[search_products_tool],
+    llm=llm,
+    max_iter=2,
     verbose=True,
 )
-
-
-#==========================================
-# 8. AGENT 2 — ANALYZER
-# ==========================================
 
 analyzer_agent = Agent(
     role="Quantitative Product Analyst",
     goal=(
-        "Take the Researcher's JSON output (requirements + products) exactly as "
-        "given, wrap it into the input shape expected by the Score Products "
-        "tool, and call that tool exactly once. Do not modify, filter, "
-        "reformat, re-sort, or add any field to the products before sending "
-        "them to the tool — pass them through faithfully. After the tool "
-        "returns, output its JSON result completely unchanged: same fields, "
-        "same order, same values. You are strictly forbidden from computing, "
-        "adjusting, or rounding any score yourself, even if a score looks "
-        "'wrong' to you — the tool's math is the single source of truth."
+        "Call Score Products tool once with the researcher's JSON input, "
+        "and return the scored products JSON array."
     ),
-    backstory=(
-        "You are a meticulous, almost obsessively literal analyst. You know "
-        "that LLMs are unreliable at arithmetic, so you never trust your own "
-        "mental math for scoring — you always delegate to the deterministic "
-        "Score Products tool and treat its output as ground truth. Your only "
-        "value-add is making sure the tool gets clean, correctly-shaped input."
-    ),
+    backstory="You are a data analyst who scores products accurately using deterministic tools.",
     tools=[score_products_tool],
+    llm=llm,
+    max_iter=2,
     verbose=True,
 )
-
-
-
-# ==========================================
-# 9. AGENT 3 — RECOMMENDER
-# ==========================================
 
 recommender_agent = Agent(
     role="Customer-Facing Recommendation Advisor",
     goal=(
-        "From the ranked, scored product list you receive as context (already "
-        "sorted best-first), select the top 3 products (or fewer if fewer than "
-        "3 exist) and produce a final answer matching the FinalRecommendation "
-        "schema exactly.\n"
-        "For each selected product:\n"
-        "- Write a short (1-3 sentence), specific reason tied to the user's "
-        "actual use_case and budget — not a generic compliment.\n"
-        "- Explicitly flag any spec that is 0 or 'unknown' as 'not found on the "
-        "source page' inside the reason, so the user isn't misled into thinking "
-        "it's confirmed missing (e.g. 0 RAM) rather than just unreported.\n"
-        "- Preserve the exact source_url from the input — never fabricate or "
-        "alter a URL.\n"
-        "Also write a 2-4 sentence summary that honestly reflects the overall "
-        "quality of the results (e.g. if all scores are low or data is sparse, "
-        "say so plainly instead of overselling).\n"
-        "Never invent a product, spec, or score that isn't present in the data "
-        "you received.\n"
-        "ALWAYS respond with raw JSON only — no markdown code fences (no ```), "
-        "no explanation text before or after the JSON object."
+        "From the scored products list, select the top 2-3 products and produce the final "
+        "JSON output matching the FinalRecommendation schema."
     ),
-    backstory=(
-        "You are a trustworthy shopping advisor who cares more about the "
-        "customer making a good decision than about sounding impressive. You "
-        "write in clear, friendly, concise language, you're transparent about "
-        "gaps in the data, and you never dress up incomplete information as "
-        "certainty."
-    ),
+    backstory="You are a trusted advisor providing clear, friendly shopping recommendations.",
+    llm=llm,
+    max_iter=1,
     verbose=True,
 )
 
 
-# ==========================================
-# 10. MAIN WORKFLOW
-# ==========================================
-#
-# All 3 agents and their tasks are wired into ONE Crew, chained together
-# with `context=`. The final task uses output_pydantic=FinalRecommendation
-# so CrewAI forces (and validates) the answer into our exact schema, which
-# we then save as a real .json file on disk AND log into MongoDB.
-
-def build_crew(user_request):
-    """
-    Builds fresh Task objects (and the Crew that runs them) for a given
-    user request. We rebuild it every run because the task descriptions
-    depend on the user's input, which changes each time.
-    """
+def build_crew(user_request: str) -> Crew:
+    """Builds the Crew for a given user request."""
 
     research_task = Task(
         description=(
             f"The user's request is: '{user_request}'.\n"
-            "1. Figure out the use case (e.g. programming, gaming, office) "
-            "and the approximate budget mentioned by the user.\n"
-            "2. Use the Search Products tool with a good search query built from "
-            "the request (e.g. 'best laptop for programming under 2500 DT') to "
-            "find real products on the web.\n"
-            "3. From the search results' titles and content, extract as many "
-            "products as you can, with these fields: name, price (0 if unknown), "
-            "cpu ('unknown' if not found), ram (0 if unknown), battery_hours "
-            "(0 if unknown), use_case, source_url (the result's url).\n"
-            "4. Return ONLY valid JSON, no extra text, in this exact shape:\n"
-            '{"requirements": {"use_case": "...", "budget": number}, '
-            '"products": [ {...}, {...} ] }'
+            "1. Identify the use case (e.g. 'programming') and budget (e.g. 2500 DT).\n"
+            "2. Execute ONE search using Search Products tool (e.g. 'pc portable 16go tunisie 2500 dt').\n"
+            "3. Extract 2 to 4 products with fields: name, price (number or 0), cpu, ram (number or 0), battery_hours (number or 0), use_case, source_url.\n"
+            "4. Return ONLY valid JSON in this exact shape:\n"
+            '{"requirements": {"use_case": "...", "budget": 0.0}, "products": [...]}\n'
+            "Do NOT run multiple searches."
         ),
-        expected_output="A single valid JSON object with keys 'requirements' and 'products'.",
+        expected_output="A single valid JSON object with 'requirements' and 'products' keys.",
         agent=researcher_agent,
         output_file=os.path.join(OUTPUT_DIR, "1_research_result.md"),
-        callback=wait_for_tpm_reset,
+        callback=task_pause_callback,
     )
 
     analysis_task = Task(
         description=(
-            "You will receive the researcher's JSON output (requirements + products) "
-            "as context. Pass that exact JSON, unchanged, as input to the Score "
-            "Products tool. Then return ONLY the tool's exact JSON output — do not "
-            "modify, reorder, or invent any score yourself."
+            "Take the researcher's JSON output and pass it into Score Products tool. "
+            "Return the resulting scored products JSON array immediately."
         ),
-        expected_output="A JSON array of products, each with a 'score' field, sorted best first.",
+        expected_output="A JSON array of products with calculated 'score' fields.",
         agent=analyzer_agent,
         context=[research_task],
         output_file=os.path.join(OUTPUT_DIR, "2_analysis_result.md"),
-        callback=wait_for_tpm_reset,
+        callback=task_pause_callback,
     )
 
     recommendation_task = Task(
         description=(
             f"The user's original request was: '{user_request}'.\n"
-            "You will receive the ranked, scored product list as context "
-            "(already sorted best first by a Python tool). Select the top 3 "
-            "products and write a short reason for each one, mentioning that "
-            "specs marked as 0 or 'unknown' were not found on the source page. "
-            "Do not invent products, specs, or scores that are not in the data "
-            "you received. Keep each product's source_url."
+            "Review the scored products and select the top recommendations.\n"
+            "Return ONLY raw JSON matching this shape:\n"
+            "{\n"
+            f'  "user_request": "{user_request}",\n'
+            '  "recommended_products": [\n'
+            '    {\n'
+            '      "name": "...",\n'
+            '      "price": 0.0,\n'
+            '      "cpu": "...",\n'
+            '      "ram": 16,\n'
+            '      "battery_hours": 0,\n'
+            '      "score": 0,\n'
+            '      "reason": "...",\n'
+            '      "source_url": "..."\n'
+            '    }\n'
+            '  ],\n'
+            '  "summary": "..."\n'
+            "}"
         ),
-        expected_output=(
-            "A JSON object matching the FinalRecommendation schema exactly: "
-            "user_request (string), recommended_products (list of products with "
-            "name, price, cpu, ram, battery_hours, score, reason, source_url), "
-            "and summary (string)."
-        ),
+        expected_output="A single raw JSON object matching the FinalRecommendation schema.",
         agent=recommender_agent,
         context=[analysis_task],
-        output_pydantic=FinalRecommendation,
-        callback=wait_for_tpm_reset,
     )
 
-    crew = Crew(
-    agents=[researcher_agent, analyzer_agent, recommender_agent],
-    tasks=[research_task, analysis_task, recommendation_task],
-    process=Process.sequential,
-    verbose=True,
-    max_rpm=2,  # limite les appels/minute pour respecter le quota Groq gratuit
-)
-
-    return crew
+    return Crew(
+        agents=[researcher_agent, analyzer_agent, recommender_agent],
+        tasks=[research_task, analysis_task, recommendation_task],
+        process=Process.sequential,
+        verbose=True,
+    )
 
 
-def run_workflow(user_request):
-    """
-    Builds the single Crew (3 agents, 3 tasks, chained via context=),
-    runs it, saves the final Pydantic-validated answer as a .json file,
-    and logs the search into MongoDB.
-    """
-    logger.info("Starting crew: researcher -> analyzer -> recommender")
+def _parse_final_recommendation(raw_text: str, user_request: str) -> FinalRecommendation:
+    """Parses raw agent output into a validated FinalRecommendation instance."""
+    cleaned = raw_text.strip()
+
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+        if m:
+            cleaned = m.group(1).strip()
+
+    s = cleaned.find("{")
+    e = cleaned.rfind("}")
+    if s != -1 and e != -1:
+        cleaned = cleaned[s:e+1]
+
+    try:
+        parsed_dict = json.loads(cleaned)
+        if "user_request" not in parsed_dict or not parsed_dict["user_request"]:
+            parsed_dict["user_request"] = user_request
+        return FinalRecommendation.model_validate(parsed_dict)
+    except Exception as e:
+        logger.error(f"Failed to parse output as JSON: {e}, raw text: {raw_text}")
+        # Fallback graceful recommendation object
+        return FinalRecommendation(
+            user_request=user_request,
+            recommended_products=[],
+            summary=cleaned[:300] if cleaned else "No recommendation summary produced."
+        )
+
+
+def run_workflow(user_request: str):
+    """Executes the 3-agent Crew and saves/logs recommendations."""
+    logger.info(f"Starting workflow for request: {user_request}")
 
     crew = build_crew(user_request)
     result = crew.kickoff()
 
-    logger.info("Crew finished")
+    logger.info("Crew execution completed")
 
-    # result.pydantic is a real FinalRecommendation object (validated by
-    # Pydantic), because the last task used output_pydantic=FinalRecommendation.
-    final_answer: FinalRecommendation = result.pydantic
+    final_answer = _parse_final_recommendation(result.raw, user_request)
     final_answer_dict = final_answer.model_dump()
 
     output_path = os.path.join(OUTPUT_DIR, "final_recommendation.json")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_answer.model_dump_json(indent=2))
 
-    logger.info(f"Final answer saved to {output_path}")
-
     save_search(user_request, final_answer_dict)
-    logger.info("Search logged in MongoDB")
-
     return final_answer, output_path
 
 
 # ==========================================
-# 11. FASTAPI APP
+# 7. FASTAPI APPLICATION
 # ==========================================
-#
-# This turns the exact same run_workflow() function into a small web API,
-# so other programs (a website, a mobile app, Postman, curl...) can call
-# your Multi-Agent Product Advisor over HTTP instead of typing in a
-# terminal. Nothing about the agents changes — the API is just a thin
-# wrapper around the same run_workflow() you already have.
-#
-# Run the API with:
-#     uvicorn main:app --reload
-#
-# Then open http://127.0.0.1:8000/docs for an interactive test page
-# (this is auto-generated by FastAPI from the Pydantic models below).
 
 app = FastAPI(title="Multi-Agent Product Advisor")
 
-# Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -481,7 +497,6 @@ app.add_middleware(
 
 
 class RecommendationRequest(BaseModel):
-    """The JSON body the API expects: just the user's request as text."""
     user_request: str = Field(
         description="What the user is looking for, e.g. 'laptop for programming under 2500 DT'"
     )
@@ -489,63 +504,54 @@ class RecommendationRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    """Simple endpoint to check the API is running."""
     return {"status": "ok"}
 
 
 @app.post("/recommend", response_model=FinalRecommendation)
 def recommend(request: RecommendationRequest):
-    """
-    Runs the full Researcher -> Analyzer -> Recommender crew for the given
-    request and returns the structured, Pydantic-validated recommendation
-    as JSON.
-    """
     try:
         final_answer, _ = run_workflow(request.user_request)
         return final_answer
     except Exception as e:
-        # Turn any internal error into a clean HTTP 500 response instead
-        # of crashing the server.
+        logger.error(f"Workflow error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/searches")
 def list_searches(limit: int = 10):
-    """Returns the most recent searches saved in MongoDB."""
     return get_previous_searches(limit=limit)
 
 
 # ==========================================
-# 12. PROGRAM ENTRY POINT (terminal mode)
+# 8. PROGRAM ENTRY POINT
 # ==========================================
-#
-# There are now two ways to use this project:
-#   1. Terminal mode:  python main.py           (asks one question, prints the answer)
-#   2. API mode:       uvicorn main:app --reload (starts a web server, see section 11)
 
 def main():
-    print("=" * 40)
+    print("=" * 50)
     print("      MULTI-AGENT PRODUCT ADVISOR")
-    print("=" * 40)
+    print("=" * 50)
 
-    user_request = input("\nWhat product are you looking for?\n> ")
+    user_request = input("\nWhat product are you looking for?\n> ").strip()
+    if not user_request:
+        user_request = "Best laptop for programming under 2500 DT with 16GB RAM"
+        print(f"Using default query: {user_request}")
 
-    print("\nProcessing...\n")
+    print("\nProcessing request with AI Agents...\n")
 
     try:
         final_answer, output_path = run_workflow(user_request)
-        print("=" * 40)
+        print("\n" + "=" * 50)
         print("FINAL RECOMMENDATION")
-        print("=" * 40)
-        print(final_answer.summary)
-        print(f"\nFull structured answer saved to: {output_path}")
+        print("=" * 50)
+        print(f"Summary: {final_answer.summary}\n")
+        for i, prod in enumerate(final_answer.recommended_products, 1):
+            print(f"{i}. {prod.name}")
+            print(f"   Price: {prod.price} | RAM: {prod.ram}GB | CPU: {prod.cpu} | Score: {prod.score}")
+            print(f"   Reason: {prod.reason}")
+            print(f"   Source: {prod.source_url}\n")
+        print(f"Structured result saved to: {output_path}")
     except Exception as e:
-        # Simple, beginner-friendly error handling.
-        # Things that can fail here: no internet connection, no MongoDB
-        # server running, an invalid or expired API key (Groq or
-        # Tavily), hitting a rate limit, or an agent returning something
-        # that doesn't match the Pydantic schema.
-        print(f"Error: {e}")
+        print(f"Error executing workflow: {e}")
 
 
 if __name__ == "__main__":
