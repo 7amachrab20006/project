@@ -34,8 +34,7 @@ from tavily import TavilyClient
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from crewai import Agent, Task, Crew, Process
-from langchain_groq import ChatGroq
-from crewai.tools import tool   
+from crewai_tools import tool
 
 
 # ==========================================
